@@ -7,13 +7,17 @@ import (
     "net"
     "os"
     "os/signal"
+    "runtime"
     "strings"
     "syscall"
     "time"
     "github.com/msbranco/goconfig"
 )
 
-const GOLOG_VERSION = "0.0.1"
+const (
+    GOLOG_VERSION = "0.0.1"
+    RECV_BUF_LEN = 1024
+)
 
 type Input struct {
     name string
@@ -31,8 +35,9 @@ func (input Input) to_json() string {
 }
 
 type Event struct {
-    name string
-    create_at time.Time
+    properties map [string] interface {}
+    created_at time.Time
+    received_at time.Time
 }
 
 type Configuration struct {
@@ -112,7 +117,7 @@ func read_config(filename string) (*Configuration, error) {
     return configuration, nil
 }
 
-func launchTcpServer(host string, port int) {
+func launchTcpServer(host string, port int, events chan<- Event) {
     iface := fmt.Sprintf("%s:%d", host, port)
     listener, err := net.Listen("tcp", iface)
     log.Println("Listening at tcp://" + iface)
@@ -125,20 +130,29 @@ func launchTcpServer(host string, port int) {
     for {
         client, err := listener.Accept()
         if err != nil {
-            log.Panic(err)
-
+            log.Println(err)
+            continue
         }
-        go serveTcpClient(client)
+        go serveTcpClient(client, events)
 
     }
 }
 
-func serveTcpClient(conn net.Conn) {
+func serveTcpClient(conn net.Conn, events chan<- Event) {
     defer conn.Close()
-    log.Println("Test")
+    log.Printf("Incoming connection: %s", conn.RemoteAddr().String())
+
+    var properties map[string] interface{}
+    err := json.NewDecoder(conn).Decode(&properties)
+    if err != nil {
+        log.Println(err)
+    } else {
+        //log.Printf("Incoming msg: %+v", properties)
+        events <- Event{properties: properties, created_at: time.Now(), received_at: time.Now()}
+    }
 }
 
-func launchUdpServer(host string, port int) {
+func launchUdpServer(host string, port int, events chan<- Event) {
     iface := fmt.Sprintf("%s:%d", host, port)
     udp_addr, _ := net.ResolveUDPAddr("udp4", iface)
     listener, err := net.ListenUDP("udp", udp_addr)
@@ -152,7 +166,8 @@ func launchUdpServer(host string, port int) {
         var buffer [512] byte
         recv_bytes, addr, err := listener.ReadFromUDP(buffer[0:])
         if err != nil {
-            log.Fatal(err)
+            log.Println(err)
+            continue
         }
         log.Println(addr)
         log.Println(recv_bytes)
@@ -161,6 +176,11 @@ func launchUdpServer(host string, port int) {
 }
 
 func main() {
+
+    ncpu := runtime.NumCPU()
+
+    runtime.GOMAXPROCS(ncpu)
+
     sigs := make(chan os.Signal, 1)
     done := make(chan bool, 1)
 
@@ -181,11 +201,19 @@ func main() {
         os.Exit(1)
     }
 
+    events := make(chan Event)
+
+    go handleEvents(events)
+
     for itype, input := range(configuration.inputs) {
         if strings.HasPrefix(itype, "tcp:") {
-            go launchTcpServer(input.parameters["hostname"].(string), input.parameters["port"].(int))
+            hostname := input.parameters["hostname"].(string)
+            port := input.parameters["port"].(int)
+            go launchTcpServer(hostname, port, events)
         } else if strings.HasPrefix(itype, "udp:") {
-            go launchUdpServer(input.parameters["hostname"].(string), input.parameters["port"].(int))
+            hostname := input.parameters["hostname"].(string)
+            port := input.parameters["port"].(int)
+            go launchUdpServer(hostname, port, events)
         }
     }
 
@@ -199,3 +227,8 @@ func main() {
     log.Println("Byebye")
 }
 
+func handleEvents(events <-chan Event) {
+    for event := range events {
+        log.Printf("Incoming msg: %+v %s", event.properties, event.created_at.Format(time.RFC3339))
+    }
+}
